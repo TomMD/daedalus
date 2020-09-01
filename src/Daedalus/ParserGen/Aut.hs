@@ -2,10 +2,12 @@ module Daedalus.ParserGen.Aut where
 
 import qualified Data.Map as Map
 import Data.Maybe (fromJust)
+import Control.Monad (join)
 import qualified Data.Set as Set
+import qualified Data.Vector as Vec
+import qualified Data.List as List
 
 import Daedalus.ParserGen.Action
-
 
 data Choice =
     UniChoice (Action, State)
@@ -13,11 +15,18 @@ data Choice =
   | ParChoice [(Action, State)]
   deriving(Show)
 
+class Aut a where
+  initialState :: a -> State
+  nextTransition :: a -> State -> Maybe Choice
+  allTransitions :: a -> [(State, Choice)]
+  isAcceptingState :: a -> State -> Bool
+  destructureAut :: a -> (State, [(State, Action, State)], State)
+
 type Transition = Map.Map State Choice
 
 type Acceptings = State
 
-data Aut = Aut
+data MapAut = MapAut
   { initials    :: State
   , transition  :: Transition
   , acceptings  :: Acceptings
@@ -27,20 +36,24 @@ data Aut = Aut
   }
   deriving Show
 
-noChoice :: Choice
-noChoice = ParChoice []
+instance Aut MapAut where
+  initialState dta = initials dta
+  nextTransition dta s = lookupAut s dta
+  allTransitions dta = Map.toList $ transition dta
+  isAcceptingState dta s = isAccepting s dta
+  destructureAut dta = toListAut dta
 
-mkAut :: State -> Transition -> Acceptings -> Aut
+mkAut :: State -> Transition -> Acceptings -> MapAut
 mkAut initial trans accepts =
-  Aut { initials = initial
-      , transition = trans
-      , acceptings = accepts
-      , acceptingsEps = Nothing
-      , transitionEps = Nothing
-      , transitionWithoutEps = Nothing
-      }
+  MapAut { initials = initial
+         , transition = trans
+         , acceptings = accepts
+         , acceptingsEps = Nothing
+         , transitionEps = Nothing
+         , transitionWithoutEps = Nothing
+         }
 
-dsAut :: Aut -> (State, Transition, Acceptings)
+dsAut :: MapAut -> (State, Transition, Acceptings)
 dsAut aut = (initials aut, transition aut, acceptings aut)
 
 
@@ -71,7 +84,7 @@ unionTr :: Transition -> Transition -> Transition
 unionTr t1 t2 =
   Map.unionWith combineCh t1 t2
 
-lookupAut :: State -> Aut -> Maybe Choice
+lookupAut :: State -> MapAut -> Maybe Choice
 lookupAut q aut = Map.lookup q (transition aut)
 
 
@@ -86,7 +99,7 @@ toListTr2 tr =
         develop n1 (ParChoice lst) = map (\ (act,n2) -> (n1,act,n2)) lst
         develop n1 (SeqChoice lst _) = map (\ (act,n2) -> (n1,act,n2)) lst  -- error "dont unfold sequential choice"
 
-toListAut :: Aut -> (State, [(State,Action,State)], State)
+toListAut :: MapAut -> (State, [(State,Action,State)], State)
 toListAut aut =
   let (i,t,f) = dsAut aut
   in (i, toListTr2 t, f)
@@ -101,7 +114,7 @@ isEffectful act =
 
 -- The transitive closure of path having no effect on the devices of a
 -- machine.
-noEffect_trans_clos :: State -> Aut -> [State]
+noEffect_trans_clos :: State -> MapAut -> [State]
 noEffect_trans_clos q aut =
   {-# SCC "TRANS_CLOS" #-}
   let (_i,t,_f) = toListAut aut
@@ -150,8 +163,11 @@ hasOnlyEpsTr ch =
     ParChoice chs -> foldr (\ (act, _n2) b -> if isEffectful act then False else b) True chs
     SeqChoice _ _ -> error "Dont apply in SeqChoice"
 
+noChoice :: Choice
+noChoice = ParChoice []
+
 -- Compute the epsilon reflexive transitive closure and stores it in the Aut
-precomputeEps :: Aut -> Aut
+precomputeEps :: MapAut -> MapAut
 precomputeEps aut =
   let
     tr = transition aut
@@ -163,28 +179,63 @@ precomputeEps aut =
     transWithoutEps = Map.map (\ b -> filterEpsTr b) completeTr
 
   in
-    Aut { initials = initials aut
-        , transition = completeTr
-        , acceptings = f
-        , acceptingsEps = Just acceptEps
-        , transitionEps = Just transEpsFiltered
-        , transitionWithoutEps = Just transWithoutEps
-        }
+    MapAut { initials = initials aut
+           , transition = completeTr
+           , acceptings = f
+           , acceptingsEps = Just acceptEps
+           , transitionEps = Just transEpsFiltered
+           , transitionWithoutEps = Just transWithoutEps
+           }
 
-getEpsTransStates :: State -> Aut -> [ State ]
+getEpsTransStates :: State -> MapAut -> [ State ]
 getEpsTransStates q aut =
   maybe (error "should precompute") (\ m -> fromJust (Map.lookup q m)) (transitionEps aut)
 
-lookupTransitionWithoutEps :: State -> Aut -> Maybe Choice
+lookupTransitionWithoutEps :: State -> MapAut -> Maybe Choice
 lookupTransitionWithoutEps q aut =
   Map.lookup q (fromJust $ transitionWithoutEps aut)
 
 
-isAccepting :: State -> Aut -> Bool
+isAccepting :: State -> MapAut -> Bool
 isAccepting q aut =
   q == acceptings aut
 
 
-isAcceptingEps :: State -> Aut -> Bool
+isAcceptingEps :: State -> MapAut -> Bool
 isAcceptingEps q aut =
   maybe (error "should precompute") (\ m -> fromJust (Map.lookup q m)) (acceptingsEps aut)
+
+
+-- For the time being we will reuse the existing implementation somewhat
+-- This shouldn't affect runtime performance
+data ArrayAut = ArrayAut {
+  transitionArray :: Vec.Vector (Maybe Choice),
+  mapAut :: MapAut
+}
+
+mkArrayAut :: State -> Transition -> Acceptings -> ArrayAut
+mkArrayAut s t a =
+  convertToArrayAut $ mkAut s t a 
+
+convertToArrayAut :: MapAut -> ArrayAut
+convertToArrayAut aut = 
+  let 
+    array = Vec.generate (maxState + 1) (\st -> Map.lookup st $ transition aut)
+  in
+    ArrayAut { transitionArray = array, mapAut = aut }
+  where
+    maxState =
+      let transitionStates = concatMap states $ allTransitions aut in
+      let allStates = initialState aut : transitionStates in
+      List.maximum allStates
+    states (state, choice) = state : choiceStates choice
+    choiceStates (UniChoice (_, endState)) = [endState]
+    choiceStates (SeqChoice lst lastState) = lastState : map snd lst
+    choiceStates (ParChoice lst) = map snd lst  
+
+instance Aut ArrayAut where
+  initialState dta = initials $ mapAut dta
+  nextTransition dta s = join $ (Vec.!?) (transitionArray dta) s
+  allTransitions dta = Map.toList $ transition $ mapAut dta
+  isAcceptingState dta s = isAccepting s $ mapAut dta
+  destructureAut dta = toListAut $ mapAut dta
